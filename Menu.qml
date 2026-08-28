@@ -1365,6 +1365,16 @@ Item {
     Util.execDetached("kill " + Util.shellQuote(pid))
   }
 
+  // Read at the moment it is asked for rather than watched in the background:
+  // the menu wants the clipboard once, and nothing here should be holding on
+  // to whatever was copied. A clipboard with no text in it -- an image, say --
+  // makes wl-paste fail, which is the right outcome: nothing is pasted.
+  function pasteIntoFilter() {
+    if (pasteProc.running) return
+    pasteProc.command = ["bash", "-c", "wl-paste --no-newline --type text 2>/dev/null"]
+    pasteProc.running = true
+  }
+
   // omarchy-launch-browser rather than xdg-open: it resolves the default
   // browser through xdg-settings and focuses the window once it is up.
   function openUrl(url) {
@@ -1587,6 +1597,25 @@ Item {
   }
 
   Process {
+    id: pasteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // The search field is one line, so newlines and tabs come in as
+        // spaces, and a clipboard holding half a file cannot become the whole
+        // query.
+        var pasted = String(text || "").replace(/\s+/g, " ").trim()
+        if (!pasted) return
+        if (pasted.length > 512) pasted = pasted.slice(0, 512)
+
+        // Appended, because the caret is always at the end here: "sha256 " and
+        // then a paste is a reasonable way to ask.
+        root.setFilter(root.filterText + pasted)
+      }
+    }
+  }
+
+  Process {
     id: processProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -1801,6 +1830,16 @@ Item {
           } else if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
             else root.cancel()
+            event.accepted = true
+          } else if ((event.key === Qt.Key_V && (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)))
+                     || (event.key === Qt.Key_Insert && (event.modifiers & Qt.ShiftModifier))) {
+            // Super+V never arrives as Super+V: omarchy binds it to "universal
+            // paste", which sends Ctrl+V on to whatever has focus -- layer
+            // surfaces like this one included. Ctrl+V is therefore the binding
+            // that matters, with Shift+Insert alongside it as the other paste
+            // the rest of Linux knows, and Super+V handled directly for anyone
+            // running this without that bind.
+            root.pasteIntoFilter()
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))

@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "dzhibas.menu",
-  "name": "My Omarchy menu",
-  "version": "1.3.0",
-  "author": "Omarchy",
-  "description": "Quickshell-powered Omarchy command menu",
+  "name": "Supercharged Omarchy menu",
+  "version": "1.3.1",
+  "author": "Nikolajus Krauklis",
+  "description": "Quickshell-powered Omarchy command menu supercharged",
   "kinds": [
     "menu",
     "bar-widget"
@@ -15,7 +15,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "My Omarchy menu",
+    "displayName": "Supercharged Omarchy menu",
     "description": "Launches the Omarchy menu",
     "category": "Compositor",
     "allowMultiple": false
