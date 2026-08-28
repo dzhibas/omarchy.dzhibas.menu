@@ -700,6 +700,241 @@ function evaluateMath(query) {
   return formatMathResult(parsed.value)
 }
 
+// --- Currency ----------------------------------------------------------------
+// "123 eur to usd" is the other search that has an obvious answer the menu can
+// give, so it answers itself the way arithmetic does: the conversion leads the
+// list and Enter copies it. The rates behind it are a daily snapshot cached on
+// disk, fetched the first time somebody actually asks for a conversion -- a
+// menu never used as a converter never reaches the network.
+
+// ISO 4217 codes the rate source carries. Static rather than read off the
+// cached rates: a query has to be recognised as a conversion before there is
+// anything cached to recognise it against, since recognising it is what asks
+// for the fetch.
+var CURRENCY_CODES = (
+  "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND " +
+  "BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLF CLP CNH CNY COP CRC CUP CVE " +
+  "CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP FOK GBP GEL GGP GHS GIP GMD " +
+  "GNF GTQ GYD HKD HNL HRK HTG HUF IDR ILS IMP INR IQD IRR ISK JEP JMD JOD " +
+  "JPY KES KGS KHR KID KMF KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL " +
+  "MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD " +
+  "OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK " +
+  "SGD SHP SLE SLL SOS SRD SSP STN SYP SZL THB TJS TMT TND TOP TRY TTD TVD " +
+  "TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XCG XDR XOF XPF YER " +
+  "ZAR ZMW ZWG ZWL"
+).split(" ")
+
+var CURRENCY_CODE_SET = (function() {
+  var set = {}
+  for (var i = 0; i < CURRENCY_CODES.length; i++) set[CURRENCY_CODES[i]] = true
+  return set
+})()
+
+// Only symbols with one sensible reading. "$" is claimed by a dozen dollars
+// and "kr" by four kronor; the bare ones go to the currency that owns them in
+// ordinary use, and the ambiguous rest are left to be spelled as codes.
+var CURRENCY_SYMBOLS = {
+  "$": "USD", "us$": "USD", "usd$": "USD",
+  "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR", "₽": "RUB", "₴": "UAH",
+  "₺": "TRY", "₩": "KRW", "₪": "ILS", "฿": "THB", "₫": "VND", "₱": "PHP",
+  "₦": "NGN", "₸": "KZT", "₮": "MNT", "₾": "GEL", "₼": "AZN", "₵": "GHS",
+  "₲": "PYG", "៛": "KHR", "zł": "PLN", "kč": "CZK",
+  "r$": "BRL", "c$": "CAD", "a$": "AUD", "nz$": "NZD", "hk$": "HKD", "s$": "SGD"
+}
+
+// Typing the name instead of the code is the same question.
+var CURRENCY_WORDS = {
+  euro: "EUR", euros: "EUR",
+  dollar: "USD", dollars: "USD", buck: "USD", bucks: "USD",
+  pound: "GBP", pounds: "GBP", sterling: "GBP", quid: "GBP",
+  yen: "JPY", yuan: "CNY", rmb: "CNY",
+  rupee: "INR", rupees: "INR",
+  ruble: "RUB", rubles: "RUB", rouble: "RUB", roubles: "RUB",
+  franc: "CHF", francs: "CHF",
+  zloty: "PLN", zlotys: "PLN",
+  won: "KRW", shekel: "ILS", shekels: "ILS",
+  hryvnia: "UAH", lira: "TRY", rand: "ZAR", baht: "THB"
+}
+
+function currencyHas(table, name) {
+  return Object.prototype.hasOwnProperty.call(table, name)
+}
+
+// A code, a symbol or a name, however it was capitalised -- or "" for a word
+// that is none of them, which is how a plain search stays a plain search.
+function currencyCodeFor(token) {
+  var raw = String(token || "").trim()
+  if (!raw) return ""
+
+  var lower = raw.toLowerCase()
+  if (currencyHas(CURRENCY_SYMBOLS, lower)) return CURRENCY_SYMBOLS[lower]
+  if (currencyHas(CURRENCY_WORDS, lower)) return CURRENCY_WORDS[lower]
+
+  var upper = raw.toUpperCase()
+  return currencyHas(CURRENCY_CODE_SET, upper) ? upper : ""
+}
+
+// The target is the tail after "to"/"in"/"into"/"as"/"->", or just the last
+// word when the connector is left out ("120 usd eur"). The head is greedy, so
+// a query with more than one "to" in it splits on the last one.
+function splitCurrencyQuery(text) {
+  var connected = text.match(/^(.*\S)(?:\s+(?:to|into|in|as)\s+|\s*(?:->|=>|→)\s*)(\S.*)$/i)
+  if (connected) return { head: connected[1].trim(), to: connected[2].trim() }
+
+  var bare = text.match(/^(.*\S)\s+(\S+)$/)
+  if (bare) return { head: bare[1].trim(), to: bare[2].trim() }
+
+  return null
+}
+
+// The source currency sits on either side of the amount: "$120", "120 eur",
+// "120eur", "usd 120". A head that is only a currency converts one unit of it,
+// which is how a rate gets looked up without inventing an amount to look it
+// up with.
+//
+// Both readings are offered rather than picked, because either can be the one
+// that is a currency at all: the trailing word in "sqrt(4) eur", the leading
+// one in "usd 100". The caller keeps the first that names a currency.
+function currencyHeadSplits(head) {
+  var splits = []
+
+  var suffixed = head.match(/^(.*?)\s*([^\s0-9.,()+\-*\/%^]+)$/)
+  if (suffixed) splits.push({ code: suffixed[2], amount: suffixed[1].trim() })
+
+  var prefixed = head.match(/^([^\s0-9.,()+\-*\/%^]+)\s*(.*)$/)
+  if (prefixed) splits.push({ code: prefixed[1], amount: prefixed[2].trim() })
+
+  return splits
+}
+
+// The amount goes through the calculator rather than parseFloat: it is the
+// same grammar, it already refuses anything it does not recognise, and it
+// makes "(20+5) eur to usd" work for free. A missing amount is one unit.
+function currencyAmount(text) {
+  var raw = String(text || "").trim()
+  if (!raw) return 1
+
+  var tokens = tokenizeMath(raw)
+  if (!tokens || tokens.length === 0) return null
+
+  var parsed = parseMathTokens(tokens)
+  if (!parsed || !isFinite(parsed.value)) return null
+
+  return parsed.value
+}
+
+// { amount, from, to } for a query that reads as a conversion, or null for one
+// that does not -- which is most of them, so every step bails on the first
+// thing it cannot name.
+function parseCurrencyQuery(query) {
+  var text = String(query || "").trim()
+  if (text.charAt(text.length - 1) === "=") text = text.slice(0, -1).trim()
+  if (!text) return null
+
+  var split = splitCurrencyQuery(text)
+  if (!split) return null
+
+  var to = currencyCodeFor(split.to)
+  if (!to) return null
+
+  var splits = currencyHeadSplits(split.head)
+  for (var i = 0; i < splits.length; i++) {
+    var from = currencyCodeFor(splits[i].code)
+    if (!from) continue
+
+    var amount = currencyAmount(splits[i].amount)
+    if (amount === null) continue
+
+    return { amount: amount, from: from, to: to }
+  }
+
+  return null
+}
+
+// The snapshot is one base-relative table, so any cross rate is the ratio of
+// two of its entries and no second request is needed to get one.
+function convertCurrency(parsed, rates) {
+  if (!parsed || !rates) return null
+
+  var from = rates[parsed.from]
+  var to = rates[parsed.to]
+  if (typeof from !== "number" || typeof to !== "number") return null
+  if (!(from > 0) || !(to > 0)) return null
+
+  var rate = to / from
+  var value = parsed.amount * rate
+  if (!isFinite(value)) return null
+
+  return { value: value, rate: rate }
+}
+
+// Money reads in two decimals. An amount that rounds away to nothing there is
+// not an answer, so small ones keep digits until they say something.
+function formatCurrencyValue(value) {
+  if (typeof value !== "number" || !isFinite(value)) return ""
+
+  var magnitude = Math.abs(value)
+  var digits = 2
+  if (magnitude > 0 && magnitude < 0.01)
+    digits = Math.min(10, 2 + Math.ceil(-Math.log(magnitude) / Math.LN10))
+
+  var text = value.toFixed(digits)
+  if (digits > 2) text = text.replace(/0+$/, "").replace(/\.$/, "")
+  return /^-0(\.0*)?$/.test(text) ? text.slice(1) : text
+}
+
+// The rate is a fact about the pair rather than an amount of money, so it
+// keeps significant digits instead of decimal places: 0.00000123, not 0.00.
+// Five of them, because it rides along in a row that is one line wide and the
+// converted amount above it is where the precision actually matters.
+function formatCurrencyRate(rate) {
+  if (typeof rate !== "number" || !isFinite(rate) || rate <= 0) return ""
+  return String(parseFloat(rate.toPrecision(5)))
+}
+
+// Accepts what either of the usual free rate sources answers with -- the
+// exchangerate-api shape (base_code, time_last_update_unix) and the
+// frankfurter/ECB one (base, date) -- and normalises it to one snapshot.
+function parseCurrencyRates(text) {
+  var payload = null
+  try { payload = JSON.parse(String(text || "")) } catch (e) { return null }
+  if (!payload || !payload.rates || typeof payload.rates !== "object") return null
+
+  var base = String(payload.base_code || payload.base || "").toUpperCase()
+  var rates = {}
+  var count = 0
+
+  for (var code in payload.rates) {
+    if (!Object.prototype.hasOwnProperty.call(payload.rates, code)) continue
+    var value = payload.rates[code]
+    if (typeof value !== "number" || !isFinite(value) || value <= 0) continue
+    rates[String(code).toUpperCase()] = value
+    count += 1
+  }
+
+  if (count === 0) return null
+  // Sources differ on whether the base is one of its own rates. It is 1.
+  if (base && !currencyHas(rates, base)) { rates[base] = 1; count += 1 }
+
+  return {
+    base: base,
+    rates: rates,
+    count: count,
+    updated: Number(payload.time_last_update_unix) || 0,
+    nextUpdate: Number(payload.time_next_update_unix) || 0,
+    date: String(payload.date || "")
+  }
+}
+
+// Rates move once a day. The source says when it will next publish, so honour
+// that when it does and fall back to the age of what we have when it doesn't.
+function currencyRatesStale(snapshot, nowSeconds) {
+  if (!snapshot || !snapshot.rates || !snapshot.count) return true
+  if (snapshot.nextUpdate > 0) return nowSeconds >= snapshot.nextUpdate
+  if (snapshot.updated > 0) return nowSeconds - snapshot.updated >= 12 * 3600
+  return true
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     guardReaders: GUARD_READERS,
@@ -732,6 +967,13 @@ if (typeof module !== "undefined") {
     displayRow: displayRow,
     tokenizeMath: tokenizeMath,
     formatMathResult: formatMathResult,
-    evaluateMath: evaluateMath
+    evaluateMath: evaluateMath,
+    currencyCodeFor: currencyCodeFor,
+    parseCurrencyQuery: parseCurrencyQuery,
+    convertCurrency: convertCurrency,
+    formatCurrencyValue: formatCurrencyValue,
+    formatCurrencyRate: formatCurrencyRate,
+    parseCurrencyRates: parseCurrencyRates,
+    currencyRatesStale: currencyRatesStale
   }
 }

@@ -81,6 +81,15 @@ Item {
   property bool deleteConfirmOpen: false
   property var deleteTarget: null
   onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null }
+  // Currency conversion typed into the search: "123 eur to usd". The rates
+  // behind it are exchangerate-api's free daily snapshot, which needs no key,
+  // cached under ~/.cache and refetched about once a day.
+  readonly property string currencyRatesUrl: "https://open.er-api.com/v6/latest/EUR"
+  readonly property string currencyRatesPath: (Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") + "/.cache")) + "/omarchy/menu-exchange-rates.json"
+  property var currencyRates: null
+  property bool currencyFetchFailed: false
+  property real currencyFetchedAt: 0
+
   // Bound to the central [menu] section in shell.toml via Color.qml.
   // Each color already includes its alpha companion (composed in the
   // singleton), so consumers can drop them straight into a Rectangle.
@@ -547,6 +556,94 @@ Item {
     }
   }
 
+  // The other search that answers itself, give or take a table of rates. Same
+  // shape as the calculator row, except the answer lives on a server: the
+  // first conversion anyone types asks for the rates and stands in for the
+  // answer until they land, and every one after it reads the cached snapshot.
+  function currencyRow(query) {
+    var parsed = MenuModel.parseCurrencyQuery(query)
+    if (!parsed) return null
+
+    root.ensureCurrencyRates()
+
+    var snapshot = root.currencyRates
+    var converted = snapshot ? MenuModel.convertCurrency(parsed, snapshot.rates) : null
+    var asked = MenuModel.formatMathResult(parsed.amount) + " " + parsed.from
+    var label = ""
+    var detail = ""
+
+    if (converted) {
+      label = MenuModel.formatCurrencyValue(converted.value) + " " + parsed.to
+      // Terse because the row is one line of a narrow card: what was asked,
+      // the rate it went through, and how old that rate is.
+      detail = asked + " at " + MenuModel.formatCurrencyRate(converted.rate)
+      var asOf = root.currencyRatesDate()
+      if (asOf) detail += " · " + asOf
+    } else {
+      label = asked + " → " + parsed.to
+      if (!snapshot)
+        detail = root.currencyFetchFailed ? "Exchange rates unavailable" : "Fetching exchange rates…"
+      else
+        detail = "No rate for " + (snapshot.rates[parsed.from] ? parsed.to : parsed.from)
+    }
+
+    return {
+      itemId: "currency.result",
+      // Nothing to copy until there is an answer, so the cursor steps over it.
+      disabled: !converted,
+      kind: "currency",
+      icon: "󰄔",
+      iconFont: "",
+      appIcon: "",
+      appId: "",
+      label: label,
+      // Rows that copy carry the text to copy here; the label wears the
+      // currency code, and it is the number that is wanted on the clipboard.
+      target: converted ? MenuModel.formatCurrencyValue(converted.value) : "",
+      detail: detail,
+      path: "",
+      childCount: 0,
+      action: "",
+      provider: "",
+      score: -2,
+      section: ""
+    }
+  }
+
+  // The date the snapshot was published, which is the honest thing to put
+  // next to a rate that is up to a day old.
+  function currencyRatesDate() {
+    var snapshot = root.currencyRates
+    if (!snapshot) return ""
+    if (snapshot.updated > 0) return Qt.formatDate(new Date(snapshot.updated * 1000), "d MMM")
+    return snapshot.date || ""
+  }
+
+  // Fetched on demand -- the first conversion someone types -- so a menu never
+  // used as a converter never reaches the network, and one that is reaches it
+  // about as often as the rates change. Written to a temporary name and moved
+  // into place so a fetch cut off halfway cannot leave half a snapshot behind.
+  function ensureCurrencyRates() {
+    if (currencyRatesProc.running) return
+
+    var now = Math.floor(Date.now() / 1000)
+    if (!MenuModel.currencyRatesStale(root.currencyRates, now)) return
+    // Every keystroke of a conversion comes through here, so a fetch that
+    // failed has to stay failed for a while rather than be retried by the
+    // next character typed.
+    if (now - root.currencyFetchedAt < 60) return
+    root.currencyFetchedAt = now
+
+    var target = root.currencyRatesPath
+    var directory = target.substring(0, target.lastIndexOf("/"))
+    currencyRatesProc.command = ["bash", "-c",
+      "mkdir -p " + Util.shellQuote(directory)
+        + " && curl -fsS --max-time 8 -o " + Util.shellQuote(target + ".part")
+        + " " + Util.shellQuote(root.currencyRatesUrl)
+        + " && mv " + Util.shellQuote(target + ".part") + " " + Util.shellQuote(target)]
+    currencyRatesProc.running = true
+  }
+
   function rowSelectable(index) {
     if (index < 0 || index >= displayModel.count) return false
     return !displayModel.get(index).disabled
@@ -674,6 +771,9 @@ Item {
         for (var d = 0; d < drilldownRows.length; d++) drilldownRows[d].section = "drilldown"
       }
       rows = currentRows.concat(drilldownRows)
+
+      var conversion = root.currencyRow(query)
+      if (conversion) rows.unshift(conversion)
 
       var calculator = root.calculatorRow(query)
       if (calculator) rows.unshift(calculator)
@@ -812,8 +912,8 @@ Item {
       opened = false
       filterText = ""
       if (root.appLibrary) root.appLibrary.launch(appId, label)
-    } else if (row.kind === "calc") {
-      root.copyToClipboard(row.label)
+    } else if (row.kind === "calc" || row.kind === "currency") {
+      root.copyToClipboard(row.target || row.label)
     } else {
       root.applySelected(row.itemId, row.action)
     }
@@ -1021,6 +1121,39 @@ Item {
     onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
     onLoadFailed: { root.userMenuItems = []; root.rebuildItemsFromSources() }
     onFileChanged: reload()
+  }
+
+  Process {
+    id: currencyRatesProc
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode === 0 && exitStatus === 0) {
+        currencyRatesFile.reload()
+        return
+      }
+
+      // Offline, or the source is down. The row says so rather than sitting on
+      // "fetching…" forever; `currencyFetchedAt` keeps the retry off the next
+      // keystroke.
+      root.currencyFetchFailed = true
+      if (root.filterText.trim()) root.rebuildDisplay()
+    }
+  }
+
+  // The cached snapshot, which is a plain copy of what the rate source last
+  // answered. Missing on a machine that has never converted anything, which is
+  // what the first conversion typed goes and fixes.
+  FileView {
+    id: currencyRatesFile
+    path: root.currencyRatesPath
+    printErrors: false
+    onLoaded: {
+      var snapshot = MenuModel.parseCurrencyRates(text())
+      if (!snapshot) return
+      root.currencyRates = snapshot
+      root.currencyFetchFailed = false
+      if (root.filterText.trim()) root.rebuildDisplay()
+    }
+    onLoadFailed: root.currencyRates = null
   }
 
   // ---------------------------------------------------------------- guards
