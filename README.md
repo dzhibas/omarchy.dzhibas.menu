@@ -1,4 +1,4 @@
-# dzhibas.menu
+# Supercharged Omarchy Menu
 
 A fork of the Omarchy command menu that answers questions instead of only
 finding commands.
