@@ -20,6 +20,8 @@ exactly as before.
 | `localhost:3000` | Opens it |
 | *anything with no matches* | **Search the web** — no more dead-end "No matches" |
 
+<img width="610" height="278" alt="image" src="https://github.com/user-attachments/assets/0337630e-cdc9-4c18-92b7-da767598ead9" />
+
 Bare domains are recognised only for known top-level domains, so `MenuModel.js`
 and `install.sh` stay ordinary searches. Links open with
 `omarchy-launch-browser`, which resolves your default browser and focuses the
@@ -42,6 +44,8 @@ the decimal (`kb mb gb tb`) and binary (`kib mib gib tib`) ladders, because the
 difference between them is most of why anyone asks. Units take their full names
 too — `miles`, `pounds`, `celsius`, `kilometres`. No network, no cache.
 
+<img width="612" height="282" alt="image" src="https://github.com/user-attachments/assets/f60d7032-64c6-4937-9747-5b89fad21d59" />
+
 ### Time zones
 
 | Type | Get |
@@ -53,6 +57,8 @@ too — `miles`, `pounds`, `celsius`, `kilometres`. No network, no cache.
 Any city the system knows — the zone list comes from `timedatectl` — plus the
 usual abbreviations (`utc`, `cet`, `est`, `pst`, `ist`, `jst`, `aest`). The day
 is shown alongside the time when it isn't today's.
+
+<img width="616" height="281" alt="image" src="https://github.com/user-attachments/assets/29ff9d9f-d45c-40e3-9924-8f449788ea0f" />
 
 ### Developer utilities
 
@@ -75,6 +81,9 @@ Random bytes come from `/dev/urandom`, not `Math.random`, so `password` is
 worth trusting. The answer holds still while you finish typing and is new the
 next time you open the menu.
 
+<img width="607" height="654" alt="image" src="https://github.com/user-attachments/assets/78eb2f0b-4b61-48d3-9a3b-1ae759c5ac09" />
+
+
 ### Kill a process
 
 | Type | Get |
@@ -83,6 +92,8 @@ next time you open the menu.
 
 Enter sends `SIGTERM`. Nothing runs `ps` until `kill` is typed, and the listing
 is reused for a few seconds rather than re-run on every keystroke.
+
+<img width="612" height="285" alt="image" src="https://github.com/user-attachments/assets/9d0e490d-c74d-466c-82a9-f0d05adf9f27" />
 
 ### Calculator
 
@@ -100,6 +111,8 @@ The expression is parsed by hand rather than handed to the JavaScript engine
 that runs your shell — nothing typed into the search field is ever evaluated as
 code. A bare number stays a search term.
 
+<img width="620" height="270" alt="image" src="https://github.com/user-attachments/assets/6105d637-7315-492e-b1c2-05b2fa274d4a" />
+
 ### Currency conversion
 
 | Type | Get |
@@ -110,6 +123,8 @@ code. A bare number stays a search term.
 | `50 euros to dollars` | `58.26 USD` |
 | `(20+5) eur to usd` | `29.13 USD` |
 | `eur to usd` | Today's rate for one unit |
+
+<img width="611" height="268" alt="image" src="https://github.com/user-attachments/assets/df5c3676-fd7e-4ed7-8e86-781193adb4ca" />
 
 166 currencies, any pair. Codes, symbols (`$ € £ ¥ ₹ ₽ ₴ zł`) and names all
 work, and the amount can be any expression the calculator understands.
