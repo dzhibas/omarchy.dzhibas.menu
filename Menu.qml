@@ -22,6 +22,11 @@ Item {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
 
+    // Re-read here rather than watching the files: a live edit still lands
+    // without restarting the shell, and an unchanged file is compared and
+    // dropped before anything is rebuilt.
+    root.loadMenuSources()
+
     if (payload.fontFamily) root.fontFamily = payload.fontFamily
 
     if (payload.mode === "select" || payload.mode === "input") {
@@ -36,8 +41,7 @@ Item {
   }
 
   function refresh() {
-    defaultMenuFile.reload()
-    userMenuFile.reload()
+    root.loadMenuSources()
     return "ok"
   }
 
@@ -51,6 +55,11 @@ Item {
   property string userMenuPath: Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
   property var defaultMenuItems: []
   property var userMenuItems: []
+  // The bytes each source last yielded. Compared before anything is rebuilt so
+  // re-reading on open is cheap when nothing was edited.
+  property string defaultMenuRaw: ""
+  property string userMenuRaw: ""
+  property bool currencyCacheRead: false
   property bool opened: false
   property string mode: "menu"
   readonly property bool dmenuActive: mode === "select" || mode === "input"
@@ -250,6 +259,80 @@ Item {
     return foldedListHeight(totals, available)
   }
 
+  // ------------------------------------------------------------------
+  // Reading files off disk.
+  //
+  // Every path this shell reads sits somewhere another process can arrange:
+  // the user extension under ~/.config, the rate cache under ~/.cache. Opening
+  // one by name is three separate hazards -- a symlink pointing somewhere
+  // else, a FIFO or device that blocks the read forever, a file large enough
+  // to exhaust memory -- and all three land on the thread that draws the menu.
+  //
+  // So no read happens by name. The producer checks the file first and bounds
+  // what it can return.
+  readonly property int menuFileCeiling: 1048576     // 1 MiB of JSONC
+  readonly property int currencyFileCeiling: 262144  // 256 KiB of rates
+  readonly property int fileReadDeadline: 5          // seconds
+
+  function readFileCommand(path, maxBytes) {
+    // -L is an lstat, so a symlink at the final component is rejected however
+    // it is spelled; -f then dereferences, which leaves FIFOs, sockets,
+    // devices and directories out -- the things that turn a read into one that
+    // never returns. head -c bounds what a regular file can still cost, and
+    // timeout covers the case where the path was swapped between the check and
+    // the open.
+    var script = 'f=' + Util.shellQuote(path) + '\n'
+      + 'if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi\n'
+      + 'exec timeout ' + root.fileReadDeadline
+      + ' head -c ' + maxBytes + ' -- "$f"\n'
+    return ["bash", "-c", script]
+  }
+
+  // ------------------------------------------------------------------
+  // Running helpers.
+  //
+  // Every helper below writes to a pipe this shell drains on the thread that
+  // draws the menu, so each is bounded twice: `timeout` ends one that stalls,
+  // and `head -c` ends output that will not stop on its own. Neither bound is
+  // optional -- `ps`, `wl-paste`, a provider script and a guard batch are all
+  // capable of producing more than there is memory for, and a helper that
+  // never exits is a menu that never opens again.
+  readonly property int helperDeadline: 10           // seconds
+  readonly property int helperOutputCeiling: 262144  // 256 KiB
+
+  function boundedCommand(script, seconds, maxBytes) {
+    return ["bash", "-c",
+      'timeout ' + (seconds > 0 ? seconds : root.helperDeadline)
+      + ' bash -c ' + Util.shellQuote(script)
+      + ' | head -c ' + (maxBytes > 0 ? maxBytes : root.helperOutputCeiling)]
+  }
+
+  // Providers and guards keep their own exit codes -- both read them to tell a
+  // batch that finished from one that was cut off -- so they take the deadline
+  // without a pipe, and their ceiling is applied as their output is collected.
+  function guardedCommand(script) {
+    return ["timeout", "-k", "2", String(root.helperDeadline), "bash", "-lc", script]
+  }
+
+  function loadMenuSources() {
+    if (!defaultMenuProc.running) {
+      defaultMenuProc.command = root.readFileCommand(root.defaultMenuPath, root.menuFileCeiling)
+      defaultMenuProc.running = true
+    }
+    if (!userMenuProc.running) {
+      userMenuProc.command = root.readFileCommand(root.userMenuPath, root.menuFileCeiling)
+      userMenuProc.running = true
+    }
+  }
+
+  function loadCurrencyCache() {
+    if (currencyCacheProc.running) return
+    currencyCacheProc.command = root.readFileCommand(root.currencyRatesPath, root.currencyFileCeiling)
+    currencyCacheProc.running = true
+  }
+
+  Component.onCompleted: root.loadMenuSources()
+
   function item(id) {
     return root.items[id] || null
   }
@@ -379,7 +462,7 @@ Item {
     providerProc.providerKey = entry.provider
     providerProc.revision = root.providerRevision
     providerProc.collected = ""
-    providerProc.command = ["bash", "-lc", spec.script]
+    providerProc.command = root.guardedCommand(spec.script)
     providerProc.running = true
   }
 
@@ -793,7 +876,7 @@ Item {
     if (now - root.randomFetchedAt < 5) return false
     root.randomFetchedAt = now
 
-    randomProc.command = ["bash", "-c", "od -An -v -tu1 -N 1024 /dev/urandom"]
+    randomProc.command = root.boundedCommand("od -An -v -tu1 -N 1024 /dev/urandom", 5, 16384)
     randomProc.running = true
     return false
   }
@@ -859,7 +942,7 @@ Item {
     if (root.processList && now - root.processListedAt < 5) return
     root.processListedAt = now
 
-    processProc.command = ["bash", "-c", "ps -eo pid,comm,pcpu,rss --sort=-pcpu --no-headers"]
+    processProc.command = root.boundedCommand("ps -eo pid,comm,pcpu,rss --sort=-pcpu --no-headers", 5, 262144)
     processProc.running = true
   }
 
@@ -921,8 +1004,8 @@ Item {
     if (zoneOffsetProc.running) return false
 
     zoneOffsetProc.zone = zone
-    zoneOffsetProc.command = ["bash", "-c",
-      "TZ=" + Util.shellQuote(zone) + " date +%z; date +%z"]
+    zoneOffsetProc.command = root.boundedCommand(
+      "TZ=" + Util.shellQuote(zone) + " date +%z; date +%z", 5, 256)
     zoneOffsetProc.running = true
     return false
   }
@@ -1018,7 +1101,17 @@ Item {
   // about as often as the rates change. Written to a temporary name and moved
   // into place so a fetch cut off halfway cannot leave half a snapshot behind.
   function ensureCurrencyRates() {
-    if (currencyRatesProc.running) return
+    if (currencyRatesProc.running || currencyCacheProc.running) return
+
+    // The cache is read on the first conversion typed rather than at startup,
+    // so a menu never used as a converter never touches the file at all. Its
+    // collector rebuilds the row, which comes back through here to decide
+    // whether what it found is still current.
+    if (!root.currencyCacheRead) {
+      root.currencyCacheRead = true
+      root.loadCurrencyCache()
+      return
+    }
 
     var now = Math.floor(Date.now() / 1000)
     if (!MenuModel.currencyRatesStale(root.currencyRates, now)) return
@@ -1030,11 +1123,36 @@ Item {
 
     var target = root.currencyRatesPath
     var directory = target.substring(0, target.lastIndexOf("/"))
-    currencyRatesProc.command = ["bash", "-c",
-      "mkdir -p " + Util.shellQuote(directory)
-        + " && curl -fsS --max-time 8 -o " + Util.shellQuote(target + ".part")
-        + " " + Util.shellQuote(root.currencyRatesUrl)
-        + " && mv " + Util.shellQuote(target + ".part") + " " + Util.shellQuote(target)]
+
+    // Nothing here writes to a name anyone could have guessed. mktemp creates
+    // with O_EXCL and mode 600, so a pre-placed file or symlink at the
+    // temporary path makes the fetch fail rather than redirect it; the cache
+    // directory is checked to be ours and not writable by anyone else before
+    // that; curl is capped so a source that answers with gigabytes cannot fill
+    // the disk; and the move is a rename, which replaces a symlink sitting at
+    // the target instead of writing through it.
+    var script = [
+      'set -u',
+      'd=' + Util.shellQuote(directory),
+      't=',
+      'cleanup() { [ -n "$t" ] && rm -f -- "$t"; }',
+      'trap cleanup EXIT',
+      'mkdir -p -m 700 -- "$d" 2>/dev/null',
+      // A directory that is a symlink, or belongs to someone else, or that
+      // anyone can write to, cannot hold a cache worth trusting.
+      'if [ -L "$d" ] || [ ! -d "$d" ]; then exit 1; fi',
+      'find "$d" -maxdepth 0 -uid "$(id -u)" ! -perm /022 -print -quit 2>/dev/null | grep -q . || exit 1',
+      't=$(mktemp -- "$d/.rates.XXXXXXXXXXXX") || exit 1',
+      'curl -fsS --max-time 8 --max-filesize ' + root.currencyFileCeiling
+        + ' -o "$t" -- ' + Util.shellQuote(root.currencyRatesUrl) + ' || exit 1',
+      // curl only enforces --max-filesize against a declared length, so a
+      // chunked reply is measured here before it is kept.
+      '[ "$(wc -c < "$t")" -le ' + root.currencyFileCeiling + ' ] || exit 1',
+      'mv -f -- "$t" ' + Util.shellQuote(target) + ' || exit 1',
+      't='
+    ].join("\n")
+
+    currencyRatesProc.command = ["bash", "-c", script]
     currencyRatesProc.running = true
   }
 
@@ -1090,7 +1208,7 @@ Item {
       var detail = parts.join("\t")
       if (query && label.toLowerCase().indexOf(query) < 0
           && detail.toLowerCase().indexOf(query) < 0) continue
-      displayModel.append({
+      displayModel.append(MenuModel.sanitizeRow({
         itemId: "dmenu." + i,
         disabled: false,
         kind: "dmenu",
@@ -1107,7 +1225,7 @@ Item {
         provider: "",
         score: i,
         section: ""
-      })
+      }))
     }
 
     layoutSerial += 1
@@ -1199,7 +1317,9 @@ Item {
       }
     }
 
-    for (var k = 0; k < rows.length; k++) displayModel.append(rows[k])
+    // Sanitized here rather than in each builder: this is the one place
+    // every row passes through on its way to the ListView.
+    for (var k = 0; k < rows.length; k++) displayModel.append(MenuModel.sanitizeRow(rows[k]))
     layoutSerial += 1
 
     root.settleCursor()
@@ -1371,7 +1491,7 @@ Item {
   // makes wl-paste fail, which is the right outcome: nothing is pasted.
   function pasteIntoFilter() {
     if (pasteProc.running) return
-    pasteProc.command = ["bash", "-c", "wl-paste --no-newline --type text 2>/dev/null"]
+    pasteProc.command = root.boundedCommand("wl-paste --no-newline --type text 2>/dev/null", 5, 4096)
     pasteProc.running = true
   }
 
@@ -1454,6 +1574,15 @@ Item {
 
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+
+  // Every Text in this file sets `textFormat: Text.PlainText`. The rows show
+  // strings nobody here wrote -- desktop-entry names, process names, clipboard
+  // text, JSONC labels, currency codes off the wire -- and the default,
+  // AutoText, sniffs a string for markup and renders it as rich text if it
+  // finds any. That turns `<img src=http://...>` in an application's Name into
+  // an outbound fetch the moment the row is drawn. PlainText is the whole fix;
+  // MenuModel.sanitizeRow bounds and control-filters the same strings on the
+  // way in.
   ListModel { id: displayModel }
 
   // ----------------------------------------------------------- route surface
@@ -1503,7 +1632,16 @@ Item {
     property string collected: ""
     property int revision: 0
     stdout: SplitParser {
-      onRead: function(data) { providerProc.collected += data + "\n" }
+      onRead: function(data) {
+        // A provider script that never stops printing would otherwise grow
+        // this string until the shell runs out of memory. Stop reading and
+        // end it; what arrived already is merged as a partial list.
+        if (providerProc.collected.length >= root.helperOutputCeiling) {
+          if (providerProc.running) providerProc.running = false
+          return
+        }
+        providerProc.collected += data + "\n"
+      }
     }
     onExited: {
       if (providerProc.revision === root.providerRevision) {
@@ -1534,31 +1672,49 @@ Item {
     }
   }
 
-  // The JSONC sources are watched so live edits to the default file (or the
-  // user extension at ~/.config/omarchy/extensions/omarchy-menu.jsonc) take
-  // effect without restarting the shell.
-  FileView {
-    id: defaultMenuFile
-    path: root.defaultMenuPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: { root.defaultMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+  // The JSONC sources, read through readFileCommand rather than FileView. Both
+  // sit in directories somebody can write to -- the user extension especially
+  // -- and FileView opens whatever the path resolves to: it follows a symlink
+  // out of the directory, blocks forever on a FIFO, and reads a device or a
+  // multi-gigabyte file to the end, all on the path that draws the menu.
+  //
+  // Re-read on every open() instead of watched, and the raw text is compared
+  // before anything is rebuilt, so a live edit still takes effect the next
+  // time the menu is opened without paying for a guard batch when nothing
+  // changed.
+  Process {
+    id: defaultMenuProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "")
+        if (raw === root.defaultMenuRaw && root.rowsLoaded) return
+        root.defaultMenuRaw = raw
+        root.defaultMenuItems = root.parseMenuJsonc(raw)
+        root.rebuildItemsFromSources()
+      }
+    }
   }
 
-  FileView {
-    id: userMenuFile
-    path: root.userMenuPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onLoadFailed: { root.userMenuItems = []; root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+  // A missing user extension is the ordinary case, and reads as empty here:
+  // the helper exits non-zero and the collector finishes with no text.
+  Process {
+    id: userMenuProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "")
+        if (raw === root.userMenuRaw && root.rowsLoaded) return
+        root.userMenuRaw = raw
+        root.userMenuItems = root.parseMenuJsonc(raw)
+        root.rebuildItemsFromSources()
+      }
+    }
   }
 
   Process {
     id: zoneListProc
-    command: ["timedatectl", "list-timezones"]
+    command: root.boundedCommand("timedatectl list-timezones", 5, 65536)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -1650,7 +1806,7 @@ Item {
     id: currencyRatesProc
     onExited: function(exitCode, exitStatus) {
       if (exitCode === 0 && exitStatus === 0) {
-        currencyRatesFile.reload()
+        root.loadCurrencyCache()
         return
       }
 
@@ -1664,19 +1820,22 @@ Item {
 
   // The cached snapshot, which is a plain copy of what the rate source last
   // answered. Missing on a machine that has never converted anything, which is
-  // what the first conversion typed goes and fixes.
-  FileView {
-    id: currencyRatesFile
-    path: root.currencyRatesPath
-    printErrors: false
-    onLoaded: {
-      var snapshot = MenuModel.parseCurrencyRates(text())
-      if (!snapshot) return
-      root.currencyRates = snapshot
-      root.currencyFetchFailed = false
-      if (root.filterText.trim()) root.rebuildDisplay()
+  // what the first conversion typed goes and fixes. Read through the same
+  // helper as the menu sources: the cache lives under ~/.cache, so the file at
+  // that path is not necessarily the file this shell last wrote there.
+  Process {
+    id: currencyCacheProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var snapshot = MenuModel.parseCurrencyRates(String(text || ""))
+        root.currencyRates = snapshot
+        if (snapshot) root.currencyFetchFailed = false
+        // Rebuild either way. A cache that was missing or stale leaves the row
+        // to ask ensureCurrencyRates again, which is what starts the fetch.
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
     }
-    onLoadFailed: root.currencyRates = null
   }
 
   // ---------------------------------------------------------------- guards
@@ -1712,7 +1871,7 @@ Item {
       return
     }
     guardProc.collected = ""
-    guardProc.command = ["bash", "-lc", script]
+    guardProc.command = root.guardedCommand(script)
     guardProc.running = true
   }
 
@@ -1720,7 +1879,16 @@ Item {
     id: guardProc
     property string collected: ""
     stdout: SplitParser {
-      onRead: function(data) { guardProc.collected += data + "\n" }
+      onRead: function(data) {
+        // Same ceiling as the providers. Ending the process here leaves a
+        // non-zero exit status, which onExited already reads as a batch that
+        // was cut off -- so the last complete set of guards is kept.
+        if (guardProc.collected.length >= root.helperOutputCeiling) {
+          if (guardProc.running) guardProc.running = false
+          return
+        }
+        guardProc.collected += data + "\n"
+      }
     }
     onExited: function(exitCode, exitStatus) {
       // A batch that was killed rather than finished has only told us about
@@ -1907,10 +2075,13 @@ Item {
           color: "transparent"
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.filterText || (root.dmenuActive ? (root.dmenuPrompt + "…") : ((root.item(root.activeMenu) ? (root.item(root.activeMenu).title || root.item(root.activeMenu).label) : "Go") + "…"))
+            // Bounded like the rows: the prompt comes from whoever invoked
+            // the dmenu, and the title from the JSONC.
+            text: MenuModel.sanitizeText(root.filterText || (root.dmenuActive ? (root.dmenuPrompt + "…") : ((root.item(root.activeMenu) ? (root.item(root.activeMenu).title || root.item(root.activeMenu).label) : "Go") + "…")))
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -1994,6 +2165,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: iconText
                 visible: row.hasIcon && !row.isApp
                 text: row.icon
@@ -2035,6 +2207,7 @@ Item {
                 spacing: Style.space(3)
 
                 Text {
+                  textFormat: Text.PlainText
                   id: labelText
                   width: parent.width
                   text: row.label
@@ -2046,6 +2219,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   text: row.detail
                   visible: (root.filterText || row.kind === "dmenu") && row.detail.length > 0
@@ -2066,6 +2240,7 @@ Item {
                 spacing: 0
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: false
                   text: row.childCount
                   color: root.foreground
@@ -2076,6 +2251,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: row.kind === "menu" || row.kind === "link" ? "›" : ""
                   color: row.hasCursor ? root.selectedText : root.foreground
                   opacity: row.kind === "menu" || row.kind === "link" ? 0.36 : 0
@@ -2150,6 +2326,7 @@ Item {
             visible: displayModel.count === 0 && root.mode !== "input"
 
             Text {
+              textFormat: Text.PlainText
               text: "󰈉"
               color: root.selectedText
               opacity: 0.8
@@ -2160,6 +2337,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: root.filterText ? "No matches for “" + root.filterText + "”" : "Nothing here yet"
               color: root.foreground
               opacity: 0.7

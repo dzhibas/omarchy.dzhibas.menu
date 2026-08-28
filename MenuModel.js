@@ -1,3 +1,44 @@
+// --- Untrusted text ----------------------------------------------------------
+// Every string a row shows was written by someone else: the Name out of a
+// .desktop file, a process name out of ps, a label from the user's JSONC, a
+// currency code off the wire, whatever was on the clipboard. A row is one line
+// of a narrow card, so control characters, bidi overrides and line separators
+// have nothing to do there and plenty to do against whoever is reading -- a
+// right-to-left override rewrites what the rest of the line appears to say.
+// Strip them, and cap the length so no single row can make the list expensive
+// to lay out.
+//
+// The other half of this lives in the QML: every Text that shows one of these
+// sets `textFormat: Text.PlainText`, because AutoText would otherwise sniff a
+// string like `<img src=http://...>` as markup and go and fetch it.
+
+var TEXT_CEILING = 512
+var ICON_CEILING = 16
+
+// C0 and C1, the bidi marks, overrides and isolates, the two line separators,
+// and the byte-order mark. Zero-width joiners are left alone: they hold emoji
+// sequences together, and an application named in emoji is a real application.
+var TEXT_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u200e-\u200f\u2028-\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g
+
+function sanitizeText(value, ceiling) {
+  var text = String(value === undefined || value === null ? "" : value)
+  var limit = ceiling > 0 ? ceiling : TEXT_CEILING
+  if (text.length > limit) text = text.slice(0, limit)
+  return text.replace(TEXT_CONTROLS, " ")
+}
+
+// The last gate before a row reaches the ListView, applied to every row
+// whatever built it, so a row builder added later cannot forget it.
+function sanitizeRow(row) {
+  if (!row) return row
+  row.label = sanitizeText(row.label)
+  row.detail = sanitizeText(row.detail)
+  row.path = sanitizeText(row.path)
+  row.icon = sanitizeText(row.icon, ICON_CEILING)
+  row.iconFont = sanitizeText(row.iconFont, ICON_CEILING * 4)
+  return row
+}
+
 function stripJsonc(raw) {
   return String(raw || "")
     .replace(/^\s*\/\/[^\n]*(\n|$)/gm, "")
