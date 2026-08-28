@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dzhibas.menu",
   "name": "My Omarchy menu",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "Omarchy",
   "description": "Quickshell-powered Omarchy command menu",
   "kinds": [

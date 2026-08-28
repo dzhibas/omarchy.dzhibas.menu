@@ -80,7 +80,7 @@ Item {
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
   property bool deleteConfirmOpen: false
   property var deleteTarget: null
-  onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null }
+  onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null; utilityAnswers = ({}) }
   // Currency conversion typed into the search: "123 eur to usd". The rates
   // behind it are exchangerate-api's free daily snapshot, which needs no key,
   // cached under ~/.cache and refetched about once a day.
@@ -89,6 +89,32 @@ Item {
   property var currencyRates: null
   property bool currencyFetchFailed: false
   property real currencyFetchedAt: 0
+
+  // Randomness for the rows that make some. Math.random is not something to
+  // build a password out of, so bytes come from /dev/urandom in bulk and are
+  // drawn down from a pool; a row that needs more than is left says so and
+  // waits rather than making do with less.
+  property var randomPool: []
+  property real randomFetchedAt: 0
+  // A generated answer must not change while the query that asked for it is
+  // still being typed, so each is kept against the query that produced it --
+  // and thrown away when the menu closes, so the next one is new.
+  property var utilityAnswers: ({})
+  // The last `ps` listing, and when it was taken.
+  property string processList: ""
+  property real processListedAt: 0
+  // The system's zone database, borrowed rather than reimplemented: the zone
+  // list from timedatectl, and each zone's current offset from `date`. The
+  // engine QML runs has no Intl, so the offset is what the clock is built on.
+  property var timeZones: []
+  property var zoneOffsets: ({})
+  property real localZoneOffset: 0
+
+  // Where a search that matched nothing gets offered. A template rather than a
+  // base URL, so swapping engines stays one line however that engine spells
+  // its parameters.
+  readonly property string webSearchTemplate: "https://duckduckgo.com/?q={query}"
+  readonly property string webSearchName: "DuckDuckGo"
 
   // Bound to the central [menu] section in shell.toml via Color.qml.
   // Each color already includes its alpha companion (composed in the
@@ -528,6 +554,73 @@ Item {
     return MenuModel.displayRow(root.items, root.itemOrder, root.checkedResults, root.disabledResults, entry, detail, score, section)
   }
 
+  // Some searches answer themselves. They all end up as one row at the top of
+  // the list with the same shape, so only the icon, the two lines of text and
+  // what Enter does with it are worth writing out each time.
+  function queryRow(spec) {
+    return {
+      itemId: spec.id || (spec.kind + ".result"),
+      // A row still waiting on something it needs cannot be acted on, so the
+      // cursor steps over it until it can.
+      disabled: spec.ready === false,
+      kind: spec.kind,
+      icon: spec.icon,
+      iconFont: "",
+      appIcon: "",
+      appId: "",
+      label: spec.label,
+      // Rows that copy or open carry their payload here. The label is written
+      // to be read, and it is rarely the exact text that is wanted.
+      target: spec.payload || "",
+      detail: spec.detail || "",
+      path: "",
+      childCount: 0,
+      action: "",
+      provider: "",
+      score: -1,
+      section: ""
+    }
+  }
+
+  // The self-answering searches, in the order they get asked. Each builder
+  // takes the query and returns a row, a list of rows, or null for a query it
+  // does not recognise; the first one that recognises it wins.
+  //
+  // Order settles the overlaps. Arithmetic goes first because it is the
+  // strictest grammar. Currency goes before units so that "100 cup to eur" is
+  // the Cuban peso, while units still take "2 cup to ml" -- currency declines
+  // it, since "ml" is not money.
+  function queryRows(query) {
+    var builders = [
+      root.calculatorRow,
+      root.currencyRow,
+      root.unitRow,
+      root.timeRow,
+      root.utilityRow,
+      root.urlRow,
+      root.killRows
+    ]
+
+    for (var i = 0; i < builders.length; i++) {
+      var produced = null
+      // These parse whatever was typed, and a throw in one of them would
+      // otherwise take the whole result list down with it -- the search would
+      // go blank rather than lose a row. Log it and carry on without it.
+      try {
+        produced = builders[i](query)
+      } catch (e) {
+        console.warn("omarchy.menu: query row builder failed:", e)
+        continue
+      }
+
+      if (!produced) continue
+      var list = (produced instanceof Array) ? produced : [produced]
+      if (list.length > 0) return list
+    }
+
+    return []
+  }
+
   // A search that reads as arithmetic answers itself. Nothing in the menu
   // matches "2+3", so without this the query that most obviously has an answer
   // is the one that comes back empty; the result leads the list, and Enter
@@ -536,24 +629,338 @@ Item {
     var result = MenuModel.evaluateMath(query)
     if (!result) return null
 
-    return {
-      itemId: "calc.result",
-      disabled: false,
+    return root.queryRow({
       kind: "calc",
       icon: "󰃬",
-      iconFont: "",
-      appIcon: "",
-      appId: "",
       label: result,
-      target: "",
-      detail: "Copy to clipboard",
-      path: "",
-      childCount: 0,
-      action: "",
-      provider: "",
-      score: -1,
-      section: ""
+      detail: "Copy to clipboard"
+    })
+  }
+
+  // Currency's twin, answered from a table that ships with the plugin: no
+  // network, no cache, and an answer on the first keystroke that completes the
+  // query. A pair is only a unit conversion when both sides measure the same
+  // thing, which is what keeps it from arguing with the currency table.
+  function unitRow(query) {
+    var parsed = MenuModel.parseUnitQuery(query)
+    if (!parsed) return null
+
+    var converted = MenuModel.convertUnit(parsed)
+    if (!converted) return null
+
+    var asked = MenuModel.formatMathResult(parsed.amount) + " " + parsed.from.symbol
+    // Temperature scales disagree about zero, so there is no ratio between
+    // them to show and the row just restates what was asked.
+    var detail = converted.rate
+      ? asked + " at " + MenuModel.formatUnitValue(converted.rate)
+      : asked
+
+    return root.queryRow({
+      kind: "unit",
+      icon: "󰓡",
+      label: MenuModel.formatUnitValue(converted.value) + " " + parsed.to.symbol,
+      detail: detail,
+      payload: MenuModel.formatUnitValue(converted.value)
+    })
+  }
+
+  // The small answers a terminal usually gets opened for. A keyword and the
+  // rest of the line; the answer leads the list and Enter copies it.
+  function utilityRow(query) {
+    var parsed = MenuModel.parseUtilityQuery(query)
+    if (!parsed) return null
+
+    var answer = root.utilityAnswer(query, parsed)
+    if (!answer) return null
+
+    if (answer === "pending") {
+      return root.queryRow({
+        kind: "util",
+        icon: "󰅴",
+        label: parsed.keyword,
+        detail: "Gathering randomness…",
+        ready: false
+      })
     }
+
+    return root.queryRow({
+      kind: "util",
+      icon: "󰅴",
+      label: answer.label,
+      detail: answer.detail,
+      payload: answer.copy
+    })
+  }
+
+  function utilityAnswer(query, parsed) {
+    if (Object.prototype.hasOwnProperty.call(root.utilityAnswers, query))
+      return root.utilityAnswers[query]
+
+    var answer = root.computeUtility(parsed)
+    // A row still waiting on /dev/urandom has no answer to remember yet.
+    if (answer === "pending") return answer
+
+    root.utilityAnswers[query] = answer
+    return answer
+  }
+
+  // Returns the answer, "pending" while the randomness for it is still being
+  // read, or null for a keyword that was given nothing to work on -- which
+  // leaves "base64" on its own an ordinary search.
+  function computeUtility(parsed) {
+    var argument = parsed.argument
+    var keyword = parsed.keyword
+
+    if (keyword === "uuid") {
+      if (argument) return null
+      if (!root.ensureRandomBytes(16)) return "pending"
+      var uuid = MenuModel.uuidFromBytes(root.takeRandomBytes(16))
+      return { label: uuid, detail: "Random UUID v4", copy: uuid }
+    }
+
+    if (keyword === "password") {
+      var length = argument ? parseInt(argument, 10) : 20
+      if (!(length > 0)) return null
+      length = Math.min(length, 64)
+      // Three bytes per character leaves room for the ones rejection sampling
+      // throws away, with plenty of margin.
+      var needed = length * 3
+      if (!root.ensureRandomBytes(needed)) return "pending"
+      var password = MenuModel.passwordFromBytes(root.takeRandomBytes(needed), length)
+      if (!password) return "pending"
+      return { label: password, detail: length + " random characters", copy: password }
+    }
+
+    if (keyword === "base64" || keyword === "b64") {
+      if (!argument) return null
+      var encoded = MenuModel.base64Encode(argument)
+      return { label: encoded, detail: "base64 of “" + argument + "”", copy: encoded }
+    }
+
+    if (keyword === "b64d" || keyword === "unbase64") {
+      if (!argument) return null
+      var decoded = MenuModel.base64Decode(argument)
+      if (!decoded) return null
+      return { label: decoded, detail: "Decoded from base64", copy: decoded }
+    }
+
+    if (keyword === "urlencode") {
+      if (!argument) return null
+      var escaped = encodeURIComponent(argument)
+      return { label: escaped, detail: "Percent-encoded", copy: escaped }
+    }
+
+    if (keyword === "urldecode") {
+      if (!argument) return null
+      var unescaped = ""
+      try { unescaped = decodeURIComponent(argument) } catch (e) { return null }
+      return { label: unescaped, detail: "Percent-decoded", copy: unescaped }
+    }
+
+    if (keyword === "sha256") {
+      if (!argument) return null
+      var digest = MenuModel.sha256Hex(argument)
+      return { label: digest, detail: "SHA-256 of “" + argument + "”", copy: digest }
+    }
+
+    if (keyword === "epoch") {
+      if (!argument) {
+        var now = String(Math.floor(Date.now() / 1000))
+        return {
+          label: now,
+          detail: "Seconds since 1970 · " + Qt.formatDateTime(new Date(), "d MMM HH:mm:ss"),
+          copy: now
+        }
+      }
+      var milliseconds = MenuModel.epochMilliseconds(argument)
+      if (milliseconds === null) return null
+      var when = Qt.formatDateTime(new Date(milliseconds), "ddd d MMM yyyy HH:mm:ss")
+      return { label: when, detail: "Local time for " + argument, copy: when }
+    }
+
+    return null
+  }
+
+  // True when the pool can already cover `needed`. When it cannot, one read of
+  // /dev/urandom is started and the answer waits for it.
+  function ensureRandomBytes(needed) {
+    if (root.randomPool.length >= needed) return true
+    if (randomProc.running) return false
+
+    var now = Math.floor(Date.now() / 1000)
+    // Every keystroke asks, so a read that failed must not be retried by the
+    // next character typed.
+    if (now - root.randomFetchedAt < 5) return false
+    root.randomFetchedAt = now
+
+    randomProc.command = ["bash", "-c", "od -An -v -tu1 -N 1024 /dev/urandom"]
+    randomProc.running = true
+    return false
+  }
+
+  function takeRandomBytes(count) {
+    if (root.randomPool.length < count) return null
+
+    var taken = root.randomPool.slice(0, count)
+    root.randomPool = root.randomPool.slice(count)
+    // Top up before the pool is empty, so the next answer does not have to
+    // wait on a read that could have happened already.
+    if (root.randomPool.length < 256) root.ensureRandomBytes(1024)
+    return taken
+  }
+
+  // The one search that answers with a list rather than a single row. `ps` is
+  // the same answer whoever is asking, so it is run once and filtered here --
+  // no listing per keystroke, and none at all until "kill" is typed.
+  function killRows(query) {
+    var filter = MenuModel.parseKillQuery(query)
+    if (filter === null) return null
+
+    root.ensureProcessList()
+
+    if (!root.processList) {
+      return [root.queryRow({
+        kind: "kill", icon: "󰚌",
+        label: filter, detail: "Listing processes…", ready: false
+      })]
+    }
+
+    var found = MenuModel.parseProcessList(root.processList, filter, 8)
+    if (found.length === 0) {
+      return [root.queryRow({
+        kind: "kill", icon: "󰚌",
+        label: filter, detail: "No process by that name", ready: false
+      })]
+    }
+
+    var rows = []
+    for (var i = 0; i < found.length; i++) {
+      rows.push(root.queryRow({
+        id: "kill." + found[i].pid,
+        kind: "kill",
+        icon: "󰚌",
+        label: found[i].name,
+        detail: "pid " + found[i].pid + " · " + found[i].cpu.toFixed(1)
+              + "% cpu · " + MenuModel.formatMemory(found[i].rss),
+        payload: String(found[i].pid)
+      }))
+    }
+
+    return rows
+  }
+
+  // Held for a few seconds rather than debounced: the listing is what is
+  // expensive, and one that is seconds old is still the right answer to
+  // "what is called firefox".
+  function ensureProcessList() {
+    if (processProc.running) return
+
+    var now = Math.floor(Date.now() / 1000)
+    if (root.processList && now - root.processListedAt < 5) return
+    root.processListedAt = now
+
+    processProc.command = ["bash", "-c", "ps -eo pid,comm,pcpu,rss --sort=-pcpu --no-headers"]
+    processProc.running = true
+  }
+
+  // "time in tokyo". Two things have to be fetched before this can answer --
+  // the zone list once, then the zone's offset -- and each one that is missing
+  // shows as a row that says so rather than as nothing at all.
+  function timeRow(query) {
+    var place = MenuModel.parseTimeQuery(query)
+    if (place === null) return null
+
+    if (!root.ensureTimeZones()) return root.timePendingRow(place)
+
+    var zone = MenuModel.resolveZone(place, root.timeZones)
+    // Not a place the system has heard of. Fall through, so "now playing"
+    // stays an ordinary search.
+    if (!zone) return null
+
+    if (!root.ensureZoneOffset(zone)) return root.timePendingRow(place)
+
+    var offset = root.zoneOffsets[zone].offset
+    var there = MenuModel.zoneClock(Date.now(), offset)
+    var here = MenuModel.zoneClock(Date.now(), root.localZoneOffset)
+    // The day only earns a place on the line when it is not today's.
+    var sameDay = there.date === here.date && there.month === here.month && there.year === here.year
+    var weekday = MenuModel.zoneWeekdayName(there.weekday).slice(0, 3)
+
+    return root.queryRow({
+      kind: "time",
+      icon: "󰅐",
+      label: sameDay ? there.time : there.time + " " + weekday,
+      detail: zone + " · " + MenuModel.zoneDifference(offset, root.localZoneOffset),
+      payload: there.time
+    })
+  }
+
+  function timePendingRow(place) {
+    return root.queryRow({
+      kind: "time",
+      icon: "󰅐",
+      label: place,
+      detail: "Reading the zone database…",
+      ready: false
+    })
+  }
+
+  function ensureTimeZones() {
+    if (root.timeZones.length > 0) return true
+    if (!zoneListProc.running) zoneListProc.running = true
+    return false
+  }
+
+  // Offsets are re-read after half an hour. They only move when a zone enters
+  // or leaves summer time, and a shell that has been up for a week should not
+  // still be an hour out because of it.
+  function ensureZoneOffset(zone) {
+    var known = root.zoneOffsets[zone]
+    var now = Math.floor(Date.now() / 1000)
+    if (known && now - known.readAt < 1800) return true
+    if (zoneOffsetProc.running) return false
+
+    zoneOffsetProc.zone = zone
+    zoneOffsetProc.command = ["bash", "-c",
+      "TZ=" + Util.shellQuote(zone) + " date +%z; date +%z"]
+    zoneOffsetProc.running = true
+    return false
+  }
+
+  // A pasted link opens rather than matching nothing. Recognising one is
+  // deliberately conservative -- see parseUrlQuery -- because "MenuModel.js"
+  // gets typed into this field more often than a link to Moldova.
+  function urlRow(query) {
+    var link = MenuModel.parseUrlQuery(query)
+    if (!link) return null
+
+    // The link itself on the top line: it is the part worth reading, and the
+    // card is narrow enough that a leading "Open " pushes the end of it out.
+    return root.queryRow({
+      kind: "url",
+      icon: "󰖟",
+      label: link.display,
+      detail: "Open in browser",
+      payload: link.url
+    })
+  }
+
+  // The last resort, and the reason the menu no longer dead-ends: a search
+  // that matched nothing at all is offered to the web instead. Appended rather
+  // than returned by queryRows, so it can never crowd out a real answer.
+  function webSearchRow(query) {
+    var url = MenuModel.webSearchUrl(query, root.webSearchTemplate)
+    if (!url) return null
+
+    // The query is already on the line above, so the row says what will
+    // happen to it rather than repeating it back.
+    return root.queryRow({
+      kind: "websearch",
+      icon: "󰍉",
+      label: "Search the web",
+      detail: "Look up “" + query + "” on " + root.webSearchName,
+      payload: url
+    })
   }
 
   // The other search that answers itself, give or take a table of rates. Same
@@ -587,27 +994,14 @@ Item {
         detail = "No rate for " + (snapshot.rates[parsed.from] ? parsed.to : parsed.from)
     }
 
-    return {
-      itemId: "currency.result",
-      // Nothing to copy until there is an answer, so the cursor steps over it.
-      disabled: !converted,
+    return root.queryRow({
       kind: "currency",
       icon: "󰄔",
-      iconFont: "",
-      appIcon: "",
-      appId: "",
       label: label,
-      // Rows that copy carry the text to copy here; the label wears the
-      // currency code, and it is the number that is wanted on the clipboard.
-      target: converted ? MenuModel.formatCurrencyValue(converted.value) : "",
       detail: detail,
-      path: "",
-      childCount: 0,
-      action: "",
-      provider: "",
-      score: -2,
-      section: ""
-    }
+      payload: converted ? MenuModel.formatCurrencyValue(converted.value) : "",
+      ready: !!converted
+    })
   }
 
   // The date the snapshot was published, which is the honest thing to put
@@ -772,11 +1166,14 @@ Item {
       }
       rows = currentRows.concat(drilldownRows)
 
-      var conversion = root.currencyRow(query)
-      if (conversion) rows.unshift(conversion)
+      rows = root.queryRows(query).concat(rows)
 
-      var calculator = root.calculatorRow(query)
-      if (calculator) rows.unshift(calculator)
+      // Nothing in the menu, and nothing that answered itself. Offer to look
+      // it up rather than showing the empty state.
+      if (rows.length === 0) {
+        var fallback = root.webSearchRow(query)
+        if (fallback) rows.push(fallback)
+      }
     } else {
       for (var j = 0; j < root.itemOrder.length; j++) {
         var child = root.item(root.itemOrder[j])
@@ -912,7 +1309,12 @@ Item {
       opened = false
       filterText = ""
       if (root.appLibrary) root.appLibrary.launch(appId, label)
-    } else if (row.kind === "calc" || row.kind === "currency") {
+    } else if (row.kind === "kill") {
+      root.killProcess(row.target)
+    } else if (row.kind === "url" || row.kind === "websearch") {
+      root.openUrl(row.target)
+    } else if (row.kind === "calc" || row.kind === "currency" || row.kind === "unit"
+             || row.kind === "util" || row.kind === "time") {
       root.copyToClipboard(row.target || row.label)
     } else {
       root.applySelected(row.itemId, row.action)
@@ -950,6 +1352,27 @@ Item {
     opened = false
     filterText = ""
     root.finishRequest(value)
+  }
+
+  // SIGTERM rather than SIGKILL: the point is to close something that has
+  // stopped behaving, and letting it clean up after itself is the better
+  // default. Anything that ignores it is a job for a terminal.
+  function killProcess(pid) {
+    if (!pid) return
+    applySerial = requestSerial
+    opened = false
+    filterText = ""
+    Util.execDetached("kill " + Util.shellQuote(pid))
+  }
+
+  // omarchy-launch-browser rather than xdg-open: it resolves the default
+  // browser through xdg-settings and focuses the window once it is up.
+  function openUrl(url) {
+    if (!url) return
+    applySerial = requestSerial
+    opened = false
+    filterText = ""
+    Util.execDetached("omarchy-launch-browser " + Util.shellQuote(url))
   }
 
   // printf rather than echo so the result lands without a trailing newline,
@@ -1121,6 +1544,77 @@ Item {
     onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
     onLoadFailed: { root.userMenuItems = []; root.rebuildItemsFromSources() }
     onFileChanged: reload()
+  }
+
+  Process {
+    id: zoneListProc
+    command: ["timedatectl", "list-timezones"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var zones = String(text || "").split("\n")
+        var kept = []
+        for (var i = 0; i < zones.length; i++) {
+          var zone = zones[i].trim()
+          if (zone) kept.push(zone)
+        }
+        if (kept.length === 0) return
+
+        root.timeZones = kept
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
+  }
+
+  Process {
+    id: zoneOffsetProc
+    property string zone: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").trim().split("\n")
+        var offset = MenuModel.parseZoneOffset(lines[0])
+        var local = lines.length > 1 ? MenuModel.parseZoneOffset(lines[1]) : null
+        if (offset === null) return
+
+        if (local !== null) root.localZoneOffset = local
+        var next = root.zoneOffsets
+        next[zoneOffsetProc.zone] = { offset: offset, readAt: Math.floor(Date.now() / 1000) }
+        root.zoneOffsets = next
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
+  }
+
+  Process {
+    id: processProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.processList = String(text || "")
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
+  }
+
+  Process {
+    id: randomProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var parts = String(text || "").split(/\s+/)
+        var bytes = []
+        for (var i = 0; i < parts.length; i++) {
+          if (!parts[i]) continue
+          var value = parseInt(parts[i], 10)
+          if (value >= 0 && value <= 255) bytes.push(value)
+        }
+        if (bytes.length === 0) return
+
+        root.randomPool = root.randomPool.concat(bytes)
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
   }
 
   Process {
