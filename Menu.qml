@@ -263,29 +263,51 @@ Item {
   // Reading files off disk.
   //
   // Every path this shell reads sits somewhere another process can arrange:
-  // the user extension under ~/.config, the rate cache under ~/.cache. Opening
-  // one by name is three separate hazards -- a symlink pointing somewhere
-  // else, a FIFO or device that blocks the read forever, a file large enough
-  // to exhaust memory -- and all three land on the thread that draws the menu.
+  // the user extension under ~/.config, the rate cache under ~/.cache. A
+  // pathname is only ever a hint -- checking it and then opening it by name
+  // again is two separate resolutions of that hint, and whatever sits at the
+  // path can change in between. So the path is resolved exactly once: open
+  // first, then every check -- and the read itself -- work off that same
+  // descriptor, never the name again.
   //
-  // So no read happens by name. The producer checks the file first and bounds
-  // what it can return.
+  // O_NOFOLLOW on the open rejects a symlink at the final component outright,
+  // so a swap cannot redirect it to another file. O_NONBLOCK means a FIFO or
+  // device planted at the path returns from the open instead of blocking the
+  // thread that draws the menu. The fstat that follows reads the open
+  // descriptor -- regular file, ours or root's, within the ceiling -- which
+  // describes the bytes about to be read rather than whatever the name
+  // resolves to by then. timeout remains as the backstop for a descriptor
+  // that opened clean but stalls on read, e.g. a hung network mount.
   readonly property int menuFileCeiling: 1048576     // 1 MiB of JSONC
   readonly property int currencyFileCeiling: 262144  // 256 KiB of rates
   readonly property int fileReadDeadline: 5          // seconds
 
+  // perl is a hard dependency of the omarchy package itself, so it is always
+  // present -- no fallback path that would reintroduce a weaker read. Path
+  // and byte ceiling arrive as argv, never interpolated into a script, so
+  // there is no shell and nothing here to quote.
+  readonly property string fileReaderProgram: [
+    'use Fcntl;',
+    'my ($path, $max) = @ARGV;',
+    'sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or exit 1;',
+    'my @st = stat($fh) or exit 1;',
+    'exit 1 unless -f _;',
+    'exit 1 unless $st[4] == $< || $st[4] == 0;',
+    'exit 1 if $st[7] > $max;',
+    'my $out = "";',
+    'while (length($out) < $max) {',
+    '  my $n = sysread($fh, my $chunk, $max - length($out));',
+    '  exit 1 unless defined $n;',
+    '  last if $n == 0;',
+    '  $out .= $chunk;',
+    '}',
+    'print $out;'
+  ].join("\n")
+
   function readFileCommand(path, maxBytes) {
-    // -L is an lstat, so a symlink at the final component is rejected however
-    // it is spelled; -f then dereferences, which leaves FIFOs, sockets,
-    // devices and directories out -- the things that turn a read into one that
-    // never returns. head -c bounds what a regular file can still cost, and
-    // timeout covers the case where the path was swapped between the check and
-    // the open.
-    var script = 'f=' + Util.shellQuote(path) + '\n'
-      + 'if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi\n'
-      + 'exec timeout ' + root.fileReadDeadline
-      + ' head -c ' + maxBytes + ' -- "$f"\n'
-    return ["bash", "-c", script]
+    return ["timeout", String(root.fileReadDeadline),
+            "perl", "-e", root.fileReaderProgram,
+            "--", path, String(maxBytes)]
   }
 
   // ------------------------------------------------------------------
