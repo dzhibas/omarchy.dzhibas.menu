@@ -4,7 +4,7 @@
   "name": "Supercharged Omarchy menu",
   "version": "1.3.3",
   "author": "Nikolajus Krauklis",
-  "description": "Quickshell-powered Omarchy command menu supercharged",
+  "description": "Quickshell-powered Omarchy command menu supercharged with links/web search, unit conversion, time zones, dev utilities (uuid, password, sha256, base64, urlencode, epoch), process killing, a calculator, and currency conversion",
   "kinds": [
     "menu",
     "bar-widget"
