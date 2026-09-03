@@ -2056,7 +2056,9 @@ Item {
             } else if (root.cursorActive) root.activateIndex(root.selectedIndex)
             else root.settleCursor()
             event.accepted = true
-          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127 && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)) {
+          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127 && ((event.modifiers & ~Qt.KeypadModifier) === Qt.NoModifier || (event.modifiers & ~Qt.KeypadModifier) === Qt.ShiftModifier)) {
+            // KeypadModifier is masked off because Qt flags numpad keys with it
+            // even when NumLock makes them deliver their character.
             root.setFilter(root.filterText + event.text)
             event.accepted = true
           }
