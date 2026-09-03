@@ -73,6 +73,18 @@ Item {
   property bool rowsLoaded: false
   property string activeMenu: "root"
   property string filterText: ""
+  // Caret inside filterText plus the text-editing state around it. The line
+  // is drawn, not a TextInput, so editing is opt-in: Tab or a click enters,
+  // Tab or Escape leaves, and every key returns to list navigation.
+  property int caretIndex: 0
+  property bool editingText: false
+  onFilterTextChanged: {
+    if (root.caretIndex > root.filterText.length) root.caretIndex = root.filterText.length
+    if (!root.filterText) {
+      root.editingText = false
+      root.caretIndex = 0
+    }
+  }
   property int selectedIndex: 0
   property bool cursorActive: false
   property int requestSerial: 0
@@ -1386,9 +1398,45 @@ Item {
     revealCursor()
   }
 
-  function setFilter(nextFilter) {
+  // Caret editing for the search line. While text mode lasts the caret is an
+  // index into filterText; outside it the caret sits at the end, so these
+  // degrade to the old append-and-backspace behavior.
+  function enterTextMode() {
+    root.caretIndex = root.filterText.length
+    root.editingText = true
+    caretGlyph.lit = true
+  }
+
+  function exitTextMode() {
+    root.editingText = false
+    root.caretIndex = root.filterText.length
+  }
+
+  function moveCaret(delta) {
+    root.caretIndex = Math.max(0, Math.min(root.filterText.length, root.caretIndex + delta))
+  }
+
+  function insertAtCaret(text) {
+    if (!text) return
+    var at = Math.max(0, Math.min(root.filterText.length, root.caretIndex))
+    root.setFilter(root.filterText.slice(0, at) + text + root.filterText.slice(at), at + text.length)
+  }
+
+  function deleteBackAtCaret(word) {
+    var at = Math.max(0, Math.min(root.filterText.length, root.caretIndex))
+    if (at === 0) return
+    var start = word
+      ? root.filterText.slice(0, at).replace(/\s+$/, "").replace(/\S+$/, "").length
+      : at - 1
+    root.setFilter(root.filterText.slice(0, start) + root.filterText.slice(at), start)
+  }
+
+  function setFilter(nextFilter, caret) {
     panel.freezeCardTop()
     root.filterText = nextFilter
+    root.caretIndex = caret === undefined
+      ? root.filterText.length
+      : Math.max(0, Math.min(root.filterText.length, caret))
     root.selectedIndex = 0
     root.cursorActive = root.mode !== "input"
     root.disarmPointer()
@@ -1590,6 +1638,7 @@ Item {
     filterText = ""
     selectedIndex = 0
     cursorActive = mode !== "input"
+    if (mode === "input") root.enterTextMode()
     root.disarmPointer()
     opened = true
     rebuildDisplay()
@@ -1786,9 +1835,9 @@ Item {
         if (!pasted) return
         if (pasted.length > 512) pasted = pasted.slice(0, 512)
 
-        // Appended, because the caret is always at the end here: "sha256 " and
-        // then a paste is a reasonable way to ask.
-        root.setFilter(root.filterText + pasted)
+        // Inserted at the caret, so a paste meant for the middle of the query
+        // lands there; "sha256 " then a paste is still a reasonable ask.
+        root.insertAtCaret(pasted)
       }
     }
   }
@@ -2014,7 +2063,26 @@ Item {
             return
           }
 
-          if (event.key === Qt.Key_Delete) {
+          if (event.key === Qt.Key_Tab) {
+            if (root.editingText) root.exitTextMode()
+            else root.enterTextMode()
+            event.accepted = true
+          } else if (root.editingText && event.key === Qt.Key_Escape) {
+            root.exitTextMode()
+            event.accepted = true
+          } else if (root.editingText && (event.key === Qt.Key_Left || event.key === Qt.Key_Right)) {
+            root.moveCaret(event.key === Qt.Key_Left ? -1 : 1)
+            event.accepted = true
+          } else if (root.editingText && event.key === Qt.Key_Home) {
+            root.caretIndex = 0
+            event.accepted = true
+          } else if (root.editingText && event.key === Qt.Key_End) {
+            root.caretIndex = root.filterText.length
+            event.accepted = true
+          } else if (root.editingText && event.key === Qt.Key_Backspace) {
+            if (root.filterText) root.deleteBackAtCaret(event.modifiers & Qt.ControlModifier)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Delete) {
             root.requestDeleteSelected()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
@@ -2057,7 +2125,7 @@ Item {
             else root.settleCursor()
             event.accepted = true
           } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127 && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)) {
-            root.setFilter(root.filterText + event.text)
+            root.insertAtCaret(event.text)
             event.accepted = true
           }
         }
@@ -2097,6 +2165,7 @@ Item {
           color: "transparent"
 
           Text {
+            id: headerText
             textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.right: parent.right
@@ -2109,6 +2178,58 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             elide: Text.ElideRight
+          }
+
+          // Underline marking the search line as in text mode. Deliberately
+          // not a border: the line is a status, not a control outline.
+          Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: 1
+            color: Util.alpha(root.selectedText, 0.55)
+            visible: root.editingText
+          }
+
+          // Prefix width drives the caret x. Measured on the same sanitized
+          // string the line paints, in the same font, so the caret tracks the
+          // glyphs; when the line elides, the caret pins to the right edge.
+          TextMetrics {
+            id: caretMetrics
+            font.family: headerText.font.family
+            font.pixelSize: headerText.font.pixelSize
+            text: MenuModel.sanitizeText(root.filterText.slice(0, Math.min(root.caretIndex, root.filterText.length)))
+          }
+
+          Rectangle {
+            id: caretGlyph
+            property bool lit: true
+
+            visible: root.editingText
+            opacity: caretGlyph.lit ? 1 : 0
+            x: Math.min(caretMetrics.advanceWidth, parent.width - width)
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.max(1, Math.round(Style.space(2)))
+            height: Math.max(Style.space(14), headerText.font.pixelSize)
+            radius: width / 2
+            color: root.selectedText
+            Behavior on opacity { NumberAnimation { duration: 60 } }
+          }
+
+          Timer {
+            interval: 530
+            running: root.editingText && root.opened
+            repeat: true
+            onTriggered: caretGlyph.lit = !caretGlyph.lit
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.IBeamCursor
+            onClicked: {
+              if (!root.editingText) root.enterTextMode()
+              caretGlyph.lit = true
+            }
           }
 
         }
